@@ -100,17 +100,24 @@
     },
     {
       "id": "normalize_strip_provider_info",
-      "label": "Strip provider-specific info (Cable, Sat, etc.)",
+      "label": "Strip provider/transport terms from channel names",
       "type": "boolean",
       "default": true,
-      "helper_text": "Remove provider identifiers like Cable, Sat, Kabel that are not part of the channel name."
+      "helper_text": "Remove provider or transport identifiers (e.g. Cable, IPTV) that are not part of the channel name. Configure the terms to strip in the field below."
+    },
+    {
+      "id": "normalize_provider_terms",
+      "label": "Provider/transport terms to strip (one per line)",
+      "type": "textarea",
+      "default": "Cable\nIPTV\nTerrestrial\nDVB-T\nDVB-T2\nDVB-C\nDVB-S\nDVB-S2",
+      "helper_text": "Terms matched as whole words (case-insensitive) and removed from channel names. Add provider-specific terms for your setup, e.g. Sat, Kabel, Astra — but check first that they don't clash with actual channel names."
     },
     {
       "id": "normalize_strip_quality_extras",
-      "label": "Strip extra quality descriptors (Low, FHD+, etc.)",
+      "label": "Strip extra quality descriptors (Low, High, etc.)",
       "type": "boolean",
       "default": true,
-      "helper_text": "Remove extra quality descriptors like Low, Plus (when after a quality tag), FHD+."
+      "helper_text": "Remove Low/High when appended to a quality tag (e.g. HD Low → HD, UHD High → UHD)."
     },
     {
       "id": "normalize_custom_patterns",

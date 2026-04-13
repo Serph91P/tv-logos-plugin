@@ -319,6 +319,7 @@ class Plugin implements ChannelProcessorPluginInterface, HookablePluginInterface
             'cache_misses' => $cacheMisses,
             'country_code' => $countryCode,
             'dry_run' => $isDryRun,
+            'ignore_cache' => $ignoreCache,
         ];
 
         if ($unmatched !== []) {
@@ -651,11 +652,23 @@ class Plugin implements ChannelProcessorPluginInterface, HookablePluginInterface
      * Build the normalization configuration array from plugin settings.
      *
      * @param  array<string, mixed>  $settings
-     * @return array{enabled: bool, strip_unicode: bool, strip_raw: bool, strip_provider_info: bool, strip_quality_extras: bool, custom_patterns: list<string>}
+     * @return array{enabled: bool, strip_unicode: bool, strip_raw: bool, strip_provider_info: bool, provider_terms: list<string>, strip_quality_extras: bool, custom_patterns: list<string>}
      */
     private function buildNormalizationConfig(array $settings): array
     {
         $enabled = (bool) ($settings['normalize_channel_names'] ?? false);
+
+        $providerTerms = [];
+        $rawProviderTerms = trim((string) ($settings['normalize_provider_terms'] ?? ''));
+
+        if ($rawProviderTerms !== '') {
+            foreach (explode("\n", $rawProviderTerms) as $line) {
+                $line = trim($line);
+                if ($line !== '') {
+                    $providerTerms[] = $line;
+                }
+            }
+        }
 
         $customPatterns = [];
         $rawPatterns = trim((string) ($settings['normalize_custom_patterns'] ?? ''));
@@ -674,6 +687,7 @@ class Plugin implements ChannelProcessorPluginInterface, HookablePluginInterface
             'strip_unicode' => $enabled && (bool) ($settings['normalize_strip_unicode'] ?? true),
             'strip_raw' => $enabled && (bool) ($settings['normalize_strip_raw'] ?? true),
             'strip_provider_info' => $enabled && (bool) ($settings['normalize_strip_provider_info'] ?? true),
+            'provider_terms' => $providerTerms,
             'strip_quality_extras' => $enabled && (bool) ($settings['normalize_strip_quality_extras'] ?? true),
             'custom_patterns' => $customPatterns,
         ];
@@ -717,16 +731,15 @@ class Plugin implements ChannelProcessorPluginInterface, HookablePluginInterface
             $name = (string) preg_replace('/\b(HD|FHD|UHD|SD)\s*raw\b/iu', '$1', $name);
         }
 
-        // 3. Strip provider / transport info (Cable, Sat, Kabel, Astra, Satellit, etc.)
-        if ($config['strip_provider_info']) {
-            $name = (string) preg_replace('/\b(Cable|Sat|Kabel|Astra|Satellit|Terrestrial|DVB-[TCSA]2?|IPTV)\b/iu', '', $name);
-            // Also remove common provider tags in parentheses: (VF), (UM), (KD), (HEVC), etc.
-            $name = (string) preg_replace('/\(\s*(VF|UM|KD|KBW|HEVC|H\.?265)\s*\)/iu', '', $name);
+        // 3. Strip provider / transport terms (configurable list, one term per line in settings)
+        if ($config['strip_provider_info'] && $config['provider_terms'] !== []) {
+            $escapedTerms = array_map(fn (string $t): string => preg_quote($t, '/'), $config['provider_terms']);
+            $name = (string) preg_replace('/\b(' . implode('|', $escapedTerms) . ')\b/iu', '', $name);
         }
 
         // 4. Strip extra quality descriptors that follow a quality tag
         if ($config['strip_quality_extras']) {
-            // "HD Low" → "HD", "FHD+" → "FHD", "HD Plus" when it's a suffix not a channel name
+            // "HD Low" → "HD", "HD High" → "HD"
             $name = (string) preg_replace('/\b(HD|FHD|UHD|SD)\s*(Low|High)\b/iu', '$1', $name);
         }
 
