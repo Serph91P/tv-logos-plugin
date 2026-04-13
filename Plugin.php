@@ -157,6 +157,10 @@ class Plugin implements ChannelProcessorPluginInterface, HookablePluginInterface
 
     /**
      * Entry point for the manual enrich_logos action.
+     *
+     * Accepts optional overrides for overwrite_existing, skip_vod, and
+     * ignore_cache so the user can control these per run without changing
+     * the global plugin settings.
      */
     private function enrichFromAction(array $payload, PluginExecutionContext $context): PluginActionResult
     {
@@ -166,21 +170,39 @@ class Plugin implements ChannelProcessorPluginInterface, HookablePluginInterface
             return PluginActionResult::failure('Missing playlist_id in action payload.');
         }
 
-        return $this->processPlaylist($playlistId, $context);
+        $overrides = [];
+
+        if (array_key_exists('overwrite_existing', $payload)) {
+            $overrides['overwrite_existing'] = (bool) $payload['overwrite_existing'];
+        }
+
+        if (array_key_exists('skip_vod', $payload)) {
+            $overrides['skip_vod'] = (bool) $payload['skip_vod'];
+        }
+
+        if (array_key_exists('ignore_cache', $payload)) {
+            $overrides['ignore_cache'] = (bool) $payload['ignore_cache'];
+        }
+
+        return $this->processPlaylist($playlistId, $context, $overrides);
     }
 
     /**
      * Core enrichment logic — queries channels for the given playlist and attempts
      * to match each one against a logo from the tv-logo/tv-logos CDN.
+     *
+     * @param  array{overwrite_existing?: bool, skip_vod?: bool, ignore_cache?: bool}  $overrides
      */
-    private function processPlaylist(int $playlistId, PluginExecutionContext $context): PluginActionResult
+    private function processPlaylist(int $playlistId, PluginExecutionContext $context, array $overrides = []): PluginActionResult
     {
         $settings = $context->settings;
         $countryCode = strtolower(trim((string) ($settings['country_code'] ?? 'us')));
-        $overwriteExisting = (bool) ($settings['overwrite_existing'] ?? false);
-        $skipVod = (bool) ($settings['skip_vod'] ?? true);
+        $overwriteExisting = (bool) ($overrides['overwrite_existing'] ?? $settings['overwrite_existing'] ?? false);
+        $skipVod = (bool) ($overrides['skip_vod'] ?? $settings['skip_vod'] ?? true);
+        $ignoreCache = (bool) ($overrides['ignore_cache'] ?? false);
         $cacheTtlDays = (int) ($settings['cache_ttl_days'] ?? 7);
         $isDryRun = $context->dryRun;
+        $normConfig = $this->buildNormalizationConfig($settings);
 
         $repo = trim((string) ($settings['github_repo'] ?? self::DEFAULT_GITHUB_REPO));
         if ($repo === '') {
@@ -247,6 +269,7 @@ class Plugin implements ChannelProcessorPluginInterface, HookablePluginInterface
         $matched = 0;
         $cacheHits = 0;
         $cacheMisses = 0;
+        $unmatched = [];
 
         foreach ($channels as $i => $channel) {
             $displayName = trim((string) ($channel->title_custom ?? $channel->title ?? $channel->name_custom ?? $channel->name ?? ''));
@@ -255,13 +278,14 @@ class Plugin implements ChannelProcessorPluginInterface, HookablePluginInterface
                 continue;
             }
 
-            $cacheKey = $countryCode.':'.mb_strtolower($displayName, 'UTF-8');
+            $normalizedName = $this->normalizeChannelName($displayName, $normConfig);
+            $cacheKey = $countryCode.':'.mb_strtolower($normalizedName, 'UTF-8');
 
-            if (array_key_exists($cacheKey, $cache['matches'])) {
+            if (! $ignoreCache && array_key_exists($cacheKey, $cache['matches'])) {
                 $logoUrl = $cache['matches'][$cacheKey] ?: null;
                 $cacheHits++;
             } else {
-                $logoUrl = $this->resolveLogoUrl($displayName, $countryCode, $countryFolder, $index);
+                $logoUrl = $this->resolveLogoUrl($normalizedName, $countryCode, $countryFolder, $index);
                 $cache['matches'][$cacheKey] = $logoUrl ?? '';
                 $cacheChanged = true;
                 $cacheMisses++;
@@ -274,6 +298,9 @@ class Plugin implements ChannelProcessorPluginInterface, HookablePluginInterface
                 if (! $isDryRun) {
                     Channel::where('id', $channel->id)->update(['logo' => $logoUrl]);
                 }
+            } else {
+                $unmatched[] = $displayName;
+                $context->info("Unmatched: \"{$displayName}\"");
             }
 
             if (($i + 1) % 20 === 0) {
@@ -285,16 +312,23 @@ class Plugin implements ChannelProcessorPluginInterface, HookablePluginInterface
             $this->saveCache($cache);
         }
 
+        $resultData = [
+            'matched' => $matched,
+            'total' => $total,
+            'cache_hits' => $cacheHits,
+            'cache_misses' => $cacheMisses,
+            'country_code' => $countryCode,
+            'dry_run' => $isDryRun,
+            'ignore_cache' => $ignoreCache,
+        ];
+
+        if ($unmatched !== []) {
+            $resultData['unmatched'] = $unmatched;
+        }
+
         return PluginActionResult::success(
             sprintf('%d of %d channel(s) matched%s.', $matched, $total, $isDryRun ? ' (dry run — no changes written)' : ''),
-            [
-                'matched' => $matched,
-                'total' => $total,
-                'cache_hits' => $cacheHits,
-                'cache_misses' => $cacheMisses,
-                'country_code' => $countryCode,
-                'dry_run' => $isDryRun,
-            ]
+            $resultData
         );
     }
 
@@ -612,5 +646,114 @@ class Plugin implements ChannelProcessorPluginInterface, HookablePluginInterface
         } catch (Throwable) {
             // Non-fatal — a missing cache means the next run re-checks the CDN.
         }
+    }
+
+    /**
+     * Build the normalization configuration array from plugin settings.
+     *
+     * @param  array<string, mixed>  $settings
+     * @return array{enabled: bool, strip_unicode: bool, strip_raw: bool, strip_provider_info: bool, provider_terms: list<string>, strip_quality_extras: bool, custom_patterns: list<string>}
+     */
+    private function buildNormalizationConfig(array $settings): array
+    {
+        $enabled = (bool) ($settings['normalize_channel_names'] ?? false);
+
+        $providerTerms = [];
+        $rawProviderTerms = trim((string) ($settings['normalize_provider_terms'] ?? ''));
+
+        if ($rawProviderTerms !== '') {
+            foreach (explode("\n", $rawProviderTerms) as $line) {
+                $line = trim($line);
+                if ($line !== '') {
+                    $providerTerms[] = $line;
+                }
+            }
+        }
+
+        $customPatterns = [];
+        $rawPatterns = trim((string) ($settings['normalize_custom_patterns'] ?? ''));
+
+        if ($rawPatterns !== '') {
+            foreach (explode("\n", $rawPatterns) as $line) {
+                $line = trim($line);
+                if ($line !== '' && @preg_match($line, '') !== false) {
+                    $customPatterns[] = $line;
+                }
+            }
+        }
+
+        return [
+            'enabled' => $enabled,
+            'strip_unicode' => $enabled && (bool) ($settings['normalize_strip_unicode'] ?? true),
+            'strip_raw' => $enabled && (bool) ($settings['normalize_strip_raw'] ?? true),
+            'strip_provider_info' => $enabled && (bool) ($settings['normalize_strip_provider_info'] ?? true),
+            'provider_terms' => $providerTerms,
+            'strip_quality_extras' => $enabled && (bool) ($settings['normalize_strip_quality_extras'] ?? true),
+            'custom_patterns' => $customPatterns,
+        ];
+    }
+
+    /**
+     * Normalize a channel display name before slug generation.
+     *
+     * Applies enabled normalization rules in a fixed order to produce
+     * a cleaner name that maps more reliably to logo filenames.
+     */
+    private function normalizeChannelName(string $name, array $config): string
+    {
+        if (! $config['enabled']) {
+            return $name;
+        }
+
+        // 1. Unicode → ASCII transliteration (superscripts, subscripts, small-caps)
+        if ($config['strip_unicode']) {
+            $unicodeMap = [
+                // Superscripts
+                '⁰' => '0', '¹' => '1', '²' => '2', '³' => '3', '⁴' => '4',
+                '⁵' => '5', '⁶' => '6', '⁷' => '7', '⁸' => '8', '⁹' => '9',
+                '⁺' => '+', '⁻' => '-',
+                // Subscripts
+                '₀' => '0', '₁' => '1', '₂' => '2', '₃' => '3', '₄' => '4',
+                '₅' => '5', '₆' => '6', '₇' => '7', '₈' => '8', '₉' => '9',
+                // Small-caps Latin
+                'ᴀ' => 'A', 'ʙ' => 'B', 'ᴄ' => 'C', 'ᴅ' => 'D', 'ᴇ' => 'E',
+                'ꜰ' => 'F', 'ɢ' => 'G', 'ʜ' => 'H', 'ɪ' => 'I', 'ᴊ' => 'J',
+                'ᴋ' => 'K', 'ʟ' => 'L', 'ᴍ' => 'M', 'ɴ' => 'N', 'ᴏ' => 'O',
+                'ᴘ' => 'P', 'ꞯ' => 'Q', 'ʀ' => 'R', 'ꜱ' => 'S', 'ᴛ' => 'T',
+                'ᴜ' => 'U', 'ᴠ' => 'V', 'ᴡ' => 'W', 'ʏ' => 'Y', 'ᴢ' => 'Z',
+            ];
+
+            $name = strtr($name, $unicodeMap);
+        }
+
+        // 2. Strip "raw" / "RAW" appended to quality tags (e.g. "HDraw" → "HD")
+        if ($config['strip_raw']) {
+            $name = (string) preg_replace('/\b(HD|FHD|UHD|SD)\s*raw\b/iu', '$1', $name);
+        }
+
+        // 3. Strip provider / transport terms (configurable list, one term per line in settings)
+        if ($config['strip_provider_info'] && $config['provider_terms'] !== []) {
+            $escapedTerms = array_map(fn (string $t): string => preg_quote($t, '/'), $config['provider_terms']);
+            $name = (string) preg_replace('/\b(' . implode('|', $escapedTerms) . ')\b/iu', '', $name);
+        }
+
+        // 4. Strip extra quality descriptors that follow a quality tag
+        if ($config['strip_quality_extras']) {
+            // "HD Low" → "HD", "HD High" → "HD"
+            $name = (string) preg_replace('/\b(HD|FHD|UHD|SD)\s*(Low|High)\b/iu', '$1', $name);
+        }
+
+        // 5. Apply user-defined custom regex patterns (each pattern replaces match with empty string)
+        foreach ($config['custom_patterns'] as $pattern) {
+            $result = @preg_replace($pattern, '', $name);
+            if ($result !== null) {
+                $name = $result;
+            }
+        }
+
+        // Final cleanup: collapse whitespace, trim
+        $name = trim((string) preg_replace('/\s{2,}/', ' ', $name));
+
+        return $name;
     }
 }
