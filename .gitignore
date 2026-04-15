@@ -13,3 +13,5 @@
 # PHP deps (plugins ship no Composer deps)
 /vendor/
 composer.lock
+
+*.log
