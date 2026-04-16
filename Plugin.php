@@ -293,14 +293,12 @@ class Plugin implements ChannelProcessorPluginInterface, HookablePluginInterface
 
             if ($logoUrl !== null) {
                 $matched++;
-                $context->info("Matched: \"{$displayName}\" → {$logoUrl}");
 
                 if (! $isDryRun) {
                     Channel::where('id', $channel->id)->update(['logo' => $logoUrl]);
                 }
             } else {
                 $unmatched[] = $displayName;
-                $context->info("Unmatched: \"{$displayName}\"");
             }
 
             if (($i + 1) % 20 === 0) {
@@ -335,13 +333,10 @@ class Plugin implements ChannelProcessorPluginInterface, HookablePluginInterface
     /**
      * Attempt to resolve a CDN logo URL for the given channel name.
      *
-     * When an index is available (fetched once per run from the GitHub Contents
-     * API), resolution is a pure O(1) array lookup — no HTTP requests per channel.
+     * When an index is available, performs a comprehensive filename-based search
+     * across ALL subfolders (hd/, sky-sport/hd/, custom/, etc.), preferring
+     * HD subfolders for HD-hinted channels.
      * Falls back to sequential CDN HEAD checks only when the index is unavailable.
-     *
-     * Tries candidate slugs with and without quality tokens (when present), then
-     * probes country root and subfolders (for example `hd/`) in a quality-aware
-     * order so channels like "Das Erste HD" can resolve to HD-specific assets.
      *
      * @param  array<string, true>  $index  Filename → true map; empty array triggers HEAD fallback.
      */
@@ -358,25 +353,92 @@ class Plugin implements ChannelProcessorPluginInterface, HookablePluginInterface
 
         $filenames = $this->buildFilenamesForSlugs($slugs, $countryCode);
 
+        // When an index is available, search all subfolders by basename for best match.
+        if ($index !== []) {
+            $result = $this->resolveFromIndex($filenames, $channelName, $countryFolder, $index);
+
+            if ($result !== null) {
+                return $result;
+            }
+
+            return $this->compactIndexMatch($slugs, $countryCode, $countryFolder, $channelName, $index);
+        }
+
+        // HEAD fallback when index is unavailable.
         foreach ($this->preferredQualityFolders($channelName) as $folder) {
             foreach ($filenames as $filename) {
                 $relativePath = $folder === '' ? $filename : "{$folder}/{$filename}";
                 $url = $this->cdnBase."/{$countryFolder}/{$relativePath}";
 
-                $exists = $index !== []
-                    ? isset($index[strtolower($relativePath)])
-                    : $this->urlExists($url);
-
-                if ($exists) {
+                if ($this->urlExists($url)) {
                     return $url;
                 }
             }
         }
 
-        // Compact matching fallback — strips all hyphens from both sides so that
-        // minor hyphenation differences (e.g. "sport1" vs "sport-1") still match.
-        if ($index !== []) {
-            return $this->compactIndexMatch($slugs, $countryCode, $countryFolder, $channelName, $index);
+        return null;
+    }
+
+    /**
+     * Resolve a logo URL by searching the pre-fetched index across ALL subfolders.
+     *
+     * Builds a basename lookup from the index so that files in nested subfolders
+     * like sky-sport/hd/ or custom/hd/ are found regardless of folder structure.
+     * When multiple paths match the same filename, prefers HD subfolders for
+     * HD-hinted channels.
+     *
+     * @param  array<int, string>  $filenames
+     * @param  array<string, true>  $index
+     */
+    private function resolveFromIndex(array $filenames, string $channelName, string $countryFolder, array $index): ?string
+    {
+        $hdPreferred = (bool) preg_match('/\b(hd|fhd|uhd|4k|8k|1080[pi]|720p)\b/iu', $channelName);
+
+        // Build a basename → [relativePaths…] lookup for efficient searching.
+        $byBasename = [];
+
+        foreach ($index as $relativePath => $_) {
+            $bn = strtolower(basename($relativePath));
+            $byBasename[$bn][] = $relativePath;
+        }
+
+        foreach ($filenames as $filename) {
+            $lowFilename = strtolower($filename);
+
+            if (! isset($byBasename[$lowFilename])) {
+                continue;
+            }
+
+            $paths = $byBasename[$lowFilename];
+
+            // Single match — return immediately.
+            if (count($paths) === 1) {
+                return $this->cdnBase."/{$countryFolder}/{$paths[0]}";
+            }
+
+            // Multiple matches — pick the best based on quality preference.
+            $hdMatch = null;
+            $rootMatch = null;
+
+            foreach ($paths as $path) {
+                $inHd = str_contains($path, '/hd/') || str_starts_with($path, 'hd/');
+
+                if ($inHd) {
+                    $hdMatch ??= $path;
+                } elseif (! str_contains($path, '/')) {
+                    $rootMatch ??= $path;
+                }
+            }
+
+            if ($hdPreferred && $hdMatch !== null) {
+                return $this->cdnBase."/{$countryFolder}/{$hdMatch}";
+            }
+
+            if ($rootMatch !== null) {
+                return $this->cdnBase."/{$countryFolder}/{$rootMatch}";
+            }
+
+            return $this->cdnBase."/{$countryFolder}/{$paths[0]}";
         }
 
         return null;
@@ -397,7 +459,9 @@ class Plugin implements ChannelProcessorPluginInterface, HookablePluginInterface
             $filenames[] = "{$slug}.png";
 
             $parts = explode('-', $slug);
-            if (count($parts) > 1) {
+            $lastPart = end($parts);
+            $qualitySuffixes = ['hd', 'fhd', 'uhd', 'sd', '4k', '8k'];
+            if (count($parts) > 1 && ! ctype_digit($lastPart) && ! in_array($lastPart, $qualitySuffixes, true)) {
                 $shortened = implode('-', array_slice($parts, 0, -1));
                 if ($shortened !== '') {
                     $filenames[] = "{$shortened}-{$countryCode}.png";
@@ -453,7 +517,10 @@ class Plugin implements ChannelProcessorPluginInterface, HookablePluginInterface
                 $folder = dirname($relativePath);
                 $folder = $folder === '.' ? '' : $folder;
 
-                if ($folder !== $preferredFolder) {
+                $isHdPath = $folder === 'hd' || str_ends_with($folder, '/hd');
+                $wantsHd = $preferredFolder === 'hd';
+
+                if ($wantsHd !== $isHdPath) {
                     continue;
                 }
 
@@ -570,9 +637,13 @@ class Plugin implements ChannelProcessorPluginInterface, HookablePluginInterface
         $name = mb_strtolower($name, 'UTF-8');
 
         if ($stripQualityTags) {
-            // Strip quality suffixes (hd, fhd, 4k, etc.)
-            $name = preg_replace('/\b(hd|fhd|uhd|4k|8k|sd|1080[pi]|720p|hevc|h\.?264|h\.?265)\b/iu', '', $name) ?? $name;
+            // Strip quality suffixes and optional trailing modifiers (raw, low, high)
+            // e.g. "HDraw" → "", "FHD Low" → "", "HEVC" → ""
+            $name = preg_replace('/\b(hd|fhd|uhd|4k|8k|sd|1080[pi]|720p|hevc|h\.?264|h\.?265)\s*(raw|low|high)?\b/iu', '', $name) ?? $name;
         }
+
+        // Strip common IPTV transport / source terms (always, regardless of quality tag stripping)
+        $name = preg_replace('/\b(cable|sat(?:ellite)?|terrestrial|dvb[tcsh]?|iptv|ott|fta|stream|linear)\b/iu', '', $name) ?? $name;
 
         // Remove content inside any bracket type
         $name = preg_replace('/[\(\[\{][^\)\]\}]*[\)\]\}]/', '', $name) ?? $name;
@@ -731,19 +802,24 @@ class Plugin implements ChannelProcessorPluginInterface, HookablePluginInterface
             $name = (string) preg_replace('/\b(HD|FHD|UHD|SD)\s*raw\b/iu', '$1', $name);
         }
 
-        // 3. Strip provider / transport terms (configurable list, one term per line in settings)
+        // 3. Strip common IPTV transport / source terms that are never part of a channel name
+        if ($config['strip_provider_info']) {
+            $name = (string) preg_replace('/\b(Cable|Sat|Satellite|Terrestrial|DVB[TCSH]?|IPTV|OTT|FTA|Stream|Linear)\b/iu', '', $name);
+        }
+
+        // 4. Strip user-configured provider terms (one term per line in settings)
         if ($config['strip_provider_info'] && $config['provider_terms'] !== []) {
             $escapedTerms = array_map(fn (string $t): string => preg_quote($t, '/'), $config['provider_terms']);
             $name = (string) preg_replace('/\b('.implode('|', $escapedTerms).')\b/iu', '', $name);
         }
 
-        // 4. Strip extra quality descriptors that follow a quality tag
+        // 5. Strip extra quality descriptors that follow a quality tag
         if ($config['strip_quality_extras']) {
             // "HD Low" → "HD", "HD High" → "HD"
             $name = (string) preg_replace('/\b(HD|FHD|UHD|SD)\s*(Low|High)\b/iu', '$1', $name);
         }
 
-        // 5. Apply user-defined custom regex patterns (each pattern replaces match with empty string)
+        // 6. Apply user-defined custom regex patterns (each pattern replaces match with empty string)
         foreach ($config['custom_patterns'] as $pattern) {
             $result = @preg_replace($pattern, '', $name);
             if ($result !== null) {
