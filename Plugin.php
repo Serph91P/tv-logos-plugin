@@ -293,14 +293,12 @@ class Plugin implements ChannelProcessorPluginInterface, HookablePluginInterface
 
             if ($logoUrl !== null) {
                 $matched++;
-                $context->info("Matched: \"{$displayName}\" → {$logoUrl}");
 
                 if (! $isDryRun) {
                     Channel::where('id', $channel->id)->update(['logo' => $logoUrl]);
                 }
             } else {
                 $unmatched[] = $displayName;
-                $context->info("Unmatched: \"{$displayName}\"");
             }
 
             if (($i + 1) % 20 === 0) {
@@ -519,7 +517,10 @@ class Plugin implements ChannelProcessorPluginInterface, HookablePluginInterface
                 $folder = dirname($relativePath);
                 $folder = $folder === '.' ? '' : $folder;
 
-                if ($folder !== $preferredFolder) {
+                $isHdPath = $folder === 'hd' || str_ends_with($folder, '/hd');
+                $wantsHd = $preferredFolder === 'hd';
+
+                if ($wantsHd !== $isHdPath) {
                     continue;
                 }
 
