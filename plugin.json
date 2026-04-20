@@ -41,7 +41,7 @@
       "label": "Source & Target",
       "description": "Logo source repository and playlist assignment.",
       "collapsible": true,
-      "collapsed": true,
+      "collapsed": false,
       "fields": [
         {
           "id": "github_repo",
