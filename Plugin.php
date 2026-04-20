@@ -361,7 +361,7 @@ class Plugin implements ChannelProcessorPluginInterface, HookablePluginInterface
      * HD subfolders for HD-hinted channels.
      * Falls back to sequential CDN HEAD checks only when the index is unavailable.
      *
-     * @param  array<string, true>  $index       Filename → true map; empty array triggers HEAD fallback.
+     * @param  array<string, true>  $index  Filename → true map; empty array triggers HEAD fallback.
      * @param  array<string, list<string>>  $byBasename  Pre-built basename lookup (built once per run).
      */
     private function resolveLogoUrl(string $channelName, string $countryCode, string $countryFolder, array $index, array $byBasename): ?string
@@ -741,7 +741,6 @@ class Plugin implements ChannelProcessorPluginInterface, HookablePluginInterface
             return $empty;
         }
     }
-
 
     /**
      * Persist the match cache to storage.
